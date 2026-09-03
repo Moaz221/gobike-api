@@ -1,12 +1,24 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-import json
 import pandas as pd
 import numpy as np
 import io
+import math
 
 app = Flask(__name__)
 CORS(app)
+
+
+def safe_float(val):
+    if val is None:
+        return None
+    try:
+        f = float(val)
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return round(f, 4)
+    except:
+        return None
 
 
 @app.route('/')
@@ -103,6 +115,7 @@ def analyze():
         content = file.read().decode('utf-8')
         df = pd.read_csv(io.StringIO(content))
 
+        # ─── Basic Info ───
         total_rows    = int(df.shape[0])
         total_columns = int(df.shape[1])
         columns       = list(df.columns)
@@ -113,34 +126,55 @@ def analyze():
             for col, val in df.isnull().sum().items()
             if val > 0
         }
-        missing_pct   = round(float(df.isnull().sum().sum() / (df.shape[0] * df.shape[1]) * 100), 4)
+        missing_pct   = safe_float(
+            df.isnull().sum().sum() / (df.shape[0] * df.shape[1]) * 100
+        ) or 0.0
         total_missing = int(df.isnull().sum().sum())
 
+        # ─── Numeric Summary ───
         numeric_df   = df.select_dtypes(include='number')
         numeric_cols = list(numeric_df.columns)
         numeric_summary = {}
 
         for col in numeric_cols:
             s   = numeric_df[col].dropna()
+
+            if len(s) == 0:
+                numeric_summary[col] = {
+                    "mean": None, "median": None, "mode": "N/A",
+                    "std": None, "variance": None, "min": None, "max": None,
+                    "q1": None, "q3": None, "iqr": None,
+                    "skewness": None, "kurtosis": None,
+                    "outlier_count": 0, "outlier_pct": 0.0,
+                    "null_count": int(numeric_df[col].isnull().sum()),
+                    "count": 0, "scatter_data": [], "outlier_points": []
+                }
+                continue
+
             q1  = float(s.quantile(0.25))
             q3  = float(s.quantile(0.75))
             iqr = q3 - q1
+
             lower = q1 - 1.5 * iqr
             upper = q3 + 1.5 * iqr
             outliers_mask = (s < lower) | (s > upper)
             outlier_count = int(outliers_mask.sum())
 
+            # Scatter data
             sample_size  = min(200, len(s))
             sample       = s.sample(sample_size, random_state=42).reset_index(drop=True)
             scatter_data = [
                 {"x": round(float(i), 4), "y": round(float(v), 4)}
                 for i, v in enumerate(sample)
+                if not math.isnan(float(v))
             ]
 
+            # Outlier points
             outlier_vals   = s[outliers_mask].head(50).reset_index(drop=True)
             outlier_points = [
                 {"x": round(float(i), 4), "y": round(float(v), 4)}
                 for i, v in enumerate(outlier_vals)
+                if not math.isnan(float(v))
             ]
 
             try:
@@ -149,26 +183,27 @@ def analyze():
                 mode_val = "N/A"
 
             numeric_summary[col] = {
-                "mean":           round(float(s.mean()), 4),
-                "median":         round(float(s.median()), 4),
+                "mean":           safe_float(s.mean()),
+                "median":         safe_float(s.median()),
                 "mode":           mode_val,
-                "std":            round(float(s.std()), 4),
-                "variance":       round(float(s.var()), 4),
-                "min":            round(float(s.min()), 4),
-                "max":            round(float(s.max()), 4),
-                "q1":             round(q1, 4),
-                "q3":             round(q3, 4),
-                "iqr":            round(iqr, 4),
-                "skewness":       round(float(s.skew()), 4),
-                "kurtosis":       round(float(s.kurtosis()), 4),
+                "std":            safe_float(s.std()),
+                "variance":       safe_float(s.var()),
+                "min":            safe_float(s.min()),
+                "max":            safe_float(s.max()),
+                "q1":             safe_float(q1),
+                "q3":             safe_float(q3),
+                "iqr":            safe_float(iqr),
+                "skewness":       safe_float(s.skew()),
+                "kurtosis":       safe_float(s.kurtosis()),
                 "outlier_count":  outlier_count,
-                "outlier_pct":    round(outlier_count / len(s) * 100, 2) if len(s) > 0 else 0,
+                "outlier_pct":    safe_float(outlier_count / len(s) * 100) or 0.0,
                 "null_count":     int(numeric_df[col].isnull().sum()),
                 "count":          int(s.count()),
                 "scatter_data":   scatter_data,
                 "outlier_points": outlier_points
             }
 
+        # ─── Categorical Summary ───
         cat_cols = list(df.select_dtypes(include='object').columns)
         cat_summary = {}
 
@@ -186,11 +221,20 @@ def analyze():
                 }
             }
 
+        # ─── Correlation ───
         correlation = {}
         if len(numeric_cols) > 1:
-            corr_matrix = numeric_df.corr().round(4)
-            correlation = corr_matrix.to_dict()
+            corr_matrix = numeric_df.corr()
+            # عالج الـ NaN في الـ correlation
+            correlation = {
+                col: {
+                    col2: safe_float(val) or 0.0
+                    for col2, val in row.items()
+                }
+                for col, row in corr_matrix.to_dict().items()
+            }
 
+        # ─── Scatter Pairs ───
         scatter_pairs = []
         if len(numeric_cols) >= 2:
             for i in range(min(3, len(numeric_cols))):
@@ -198,12 +242,20 @@ def analyze():
                     col_x  = numeric_cols[i]
                     col_y  = numeric_cols[j]
                     paired = df[[col_x, col_y]].dropna()
-                    sample = paired.sample(min(200, len(paired)), random_state=42)
-                    points = [
-                        {"x": round(float(row[col_x]), 4),
-                         "y": round(float(row[col_y]), 4)}
-                        for _, row in sample.iterrows()
-                    ]
+
+                    if len(paired) == 0:
+                        continue
+
+                    sample = paired.sample(
+                        min(200, len(paired)), random_state=42
+                    )
+                    points = []
+                    for _, row in sample.iterrows():
+                        x = safe_float(row[col_x])
+                        y = safe_float(row[col_y])
+                        if x is not None and y is not None:
+                            points.append({"x": x, "y": y})
+
                     scatter_pairs.append({
                         "x_col":  col_x,
                         "y_col":  col_y,
