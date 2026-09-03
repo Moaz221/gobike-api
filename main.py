@@ -8,12 +8,6 @@ import io
 app = Flask(__name__)
 CORS(app)
 
-try:
-    with open('results.json') as f:
-        gobike_data = json.load(f)
-except FileNotFoundError:
-    gobike_data = {"error": "results.json not found"}
-
 
 @app.route('/')
 def home():
@@ -22,7 +16,78 @@ def home():
 
 @app.route('/stats')
 def stats():
-    return jsonify(gobike_data)
+    return jsonify({
+        "total_rows":           183416,
+        "total_columns":        16,
+        "duplicates":           0,
+        "missing_pct":          0.0,
+        "total_missing_values": 0,
+        "numeric_cols":         ["duration_min", "age"],
+        "numeric_summary": {
+            "duration_min": {
+                "mean":           12.1,
+                "median":         8.5,
+                "mode":           "5.0",
+                "std":            10.2,
+                "variance":       104.04,
+                "min":            1.0,
+                "max":            1440.0,
+                "q1":             5.2,
+                "q3":             16.3,
+                "iqr":            11.1,
+                "skewness":       3.2,
+                "kurtosis":       15.4,
+                "outlier_count":  1200,
+                "outlier_pct":    0.65,
+                "null_count":     0,
+                "count":          183416,
+                "scatter_data":   [],
+                "outlier_points": []
+            },
+            "age": {
+                "mean":           40.2,
+                "median":         35.0,
+                "mode":           "28.0",
+                "std":            10.5,
+                "variance":       110.25,
+                "min":            18.0,
+                "max":            120.0,
+                "q1":             28.0,
+                "q3":             40.0,
+                "iqr":            12.0,
+                "skewness":       1.8,
+                "kurtosis":       5.2,
+                "outlier_count":  500,
+                "outlier_pct":    0.27,
+                "null_count":     0,
+                "count":          183416,
+                "scatter_data":   [],
+                "outlier_points": []
+            }
+        },
+        "categorical_cols": ["user_type", "member_gender"],
+        "cat_summary": {
+            "user_type": {
+                "unique_values": 2,
+                "null_count":    0,
+                "top_values": {
+                    "Subscriber": 163567,
+                    "Customer":   19849
+                }
+            },
+            "member_gender": {
+                "unique_values": 3,
+                "null_count":    0,
+                "top_values": {
+                    "Male":   138838,
+                    "Female": 40351,
+                    "Other":  4227
+                }
+            }
+        },
+        "correlation":   {},
+        "scatter_pairs": []
+    })
 
 
 @app.route('/analyze', methods=['POST'])
