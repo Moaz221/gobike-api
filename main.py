@@ -38,7 +38,6 @@ def analyze():
         content = file.read().decode('utf-8')
         df = pd.read_csv(io.StringIO(content))
 
-        # ─── Basic Info ───
         total_rows    = int(df.shape[0])
         total_columns = int(df.shape[1])
         columns       = list(df.columns)
@@ -49,10 +48,9 @@ def analyze():
             for col, val in df.isnull().sum().items()
             if val > 0
         }
-        missing_pct    = round(float(df.isnull().sum().sum() / (df.shape[0] * df.shape[1]) * 100), 4)
-        total_missing  = int(df.isnull().sum().sum())
+        missing_pct   = round(float(df.isnull().sum().sum() / (df.shape[0] * df.shape[1]) * 100), 4)
+        total_missing = int(df.isnull().sum().sum())
 
-        # ─── Numeric Summary ───
         numeric_df   = df.select_dtypes(include='number')
         numeric_cols = list(numeric_df.columns)
         numeric_summary = {}
@@ -62,21 +60,19 @@ def analyze():
             q1  = float(s.quantile(0.25))
             q3  = float(s.quantile(0.75))
             iqr = q3 - q1
-            lower   = q1 - 1.5 * iqr
-            upper   = q3 + 1.5 * iqr
+            lower = q1 - 1.5 * iqr
+            upper = q3 + 1.5 * iqr
             outliers_mask = (s < lower) | (s > upper)
             outlier_count = int(outliers_mask.sum())
 
-            # Scatter data: sample 200 points (index vs value)
-            sample_size = min(200, len(s))
-            sample      = s.sample(sample_size, random_state=42).reset_index(drop=True)
+            sample_size  = min(200, len(s))
+            sample       = s.sample(sample_size, random_state=42).reset_index(drop=True)
             scatter_data = [
                 {"x": round(float(i), 4), "y": round(float(v), 4)}
                 for i, v in enumerate(sample)
             ]
 
-            # Outlier points for scatter
-            outlier_vals = s[outliers_mask].head(50).reset_index(drop=True)
+            outlier_vals   = s[outliers_mask].head(50).reset_index(drop=True)
             outlier_points = [
                 {"x": round(float(i), 4), "y": round(float(v), 4)}
                 for i, v in enumerate(outlier_vals)
@@ -108,14 +104,13 @@ def analyze():
                 "outlier_points": outlier_points
             }
 
-        # ─── Categorical Summary ───
         cat_cols = list(df.select_dtypes(include='object').columns)
         cat_summary = {}
 
         for col in cat_cols:
-            top_values    = df[col].value_counts().head(10)
-            unique_count  = int(df[col].nunique())
-            null_count    = int(df[col].isnull().sum())
+            top_values   = df[col].value_counts().head(10)
+            unique_count = int(df[col].nunique())
+            null_count   = int(df[col].isnull().sum())
 
             cat_summary[col] = {
                 "unique_values": unique_count,
@@ -126,19 +121,17 @@ def analyze():
                 }
             }
 
-        # ─── Correlation Matrix ───
         correlation = {}
         if len(numeric_cols) > 1:
             corr_matrix = numeric_df.corr().round(4)
             correlation = corr_matrix.to_dict()
 
-        # ─── Scatter between 2 numeric cols ───
         scatter_pairs = []
         if len(numeric_cols) >= 2:
             for i in range(min(3, len(numeric_cols))):
                 for j in range(i + 1, min(4, len(numeric_cols))):
-                    col_x = numeric_cols[i]
-                    col_y = numeric_cols[j]
+                    col_x  = numeric_cols[i]
+                    col_y  = numeric_cols[j]
                     paired = df[[col_x, col_y]].dropna()
                     sample = paired.sample(min(200, len(paired)), random_state=42)
                     points = [
@@ -147,12 +140,11 @@ def analyze():
                         for _, row in sample.iterrows()
                     ]
                     scatter_pairs.append({
-                        "x_col": col_x,
-                        "y_col": col_y,
+                        "x_col":  col_x,
+                        "y_col":  col_y,
                         "points": points
                     })
 
-        # ─── Final Response ───
         return jsonify({
             "total_rows":           total_rows,
             "total_columns":        total_columns,
@@ -167,6 +159,49 @@ def analyze():
             "cat_summary":          cat_summary,
             "correlation":          correlation,
             "scatter_pairs":        scatter_pairs
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/clean', methods=['POST'])
+def clean():
+    try:
+        if 'file' not in request.files:
+            return jsonify({"error": "No file uploaded"}), 400
+
+        file    = request.files['file']
+        content = file.read().decode('utf-8')
+        df      = pd.read_csv(io.StringIO(content))
+
+        before = {
+            "rows":       int(df.shape[0]),
+            "missing":    int(df.isnull().sum().sum()),
+            "duplicates": int(df.duplicated().sum())
+        }
+
+        df = df.drop_duplicates()
+
+        numeric_cols = df.select_dtypes(include='number').columns
+        for col in numeric_cols:
+            df[col].fillna(df[col].mean(), inplace=True)
+
+        cat_cols = df.select_dtypes(include='object').columns
+        for col in cat_cols:
+            if not df[col].mode().empty:
+                df[col].fillna(df[col].mode()[0], inplace=True)
+
+        after = {
+            "rows":       int(df.shape[0]),
+            "missing":    int(df.isnull().sum().sum()),
+            "duplicates": int(df.duplicated().sum())
+        }
+
+        return jsonify({
+            "before":  before,
+            "after":   after,
+            "message": "Data cleaned successfully!"
         })
 
     except Exception as e:
