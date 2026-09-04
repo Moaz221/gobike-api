@@ -1,14 +1,14 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from flask_caching import Cache
+from flask_compress import Compress
 import pandas as pd
 import numpy as np
 import io
 import time
 import logging
-from logging.handlers import RotatingFileHandler
 import traceback
 import os
 import json
@@ -16,7 +16,12 @@ import base64
 import math
 import hashlib
 import chardet
+import gzip
+import secrets
+import uuid
 from typing import Dict, Any, Optional, List
+from functools import wraps
+from datetime import datetime, timedelta
 
 # ═══════════════════════════════════════════════════════════
 # CONFIGURATION
@@ -25,15 +30,45 @@ from typing import Dict, Any, Optional, List
 class Config:
     API_VERSION = "2.1.0"
     MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50MB
-    ALLOWED_ORIGINS = os.getenv('ALLOWED_ORIGINS', '*').split(',')
-    RATE_LIMIT = os.getenv('RATE_LIMIT', '10 per minute')
+    
+    # CORS - مش مهمة للتطبيق لكن للـ testing
+    ALLOWED_ORIGINS = os.getenv(
+        'ALLOWED_ORIGINS', 
+        'http://localhost:3000,http://localhost:5173,http://localhost:5000'
+    ).split(',')
+    
+    # Rate Limiting
+    RATE_LIMIT = os.getenv('RATE_LIMIT', '20 per minute')
+    RATE_LIMIT_CLEAN = os.getenv('RATE_LIMIT_CLEAN', '5 per minute')  # أقل للـ cleaning
+    
+    # Cache
     CACHE_DEFAULT_TIMEOUT = int(os.getenv('CACHE_TIMEOUT', 300))
-    MAX_SCATTER_POINTS = 100
-    MAX_SAMPLE_SIZE = 120
-    MAX_CORRELATION_COLS = 12
-    MAX_HISTOGRAM_BINS = 12
-    MAX_CATEGORICAL_VALUES = 10
+    CACHE_THRESHOLD = 100
+    
+    # Data limits - مخصصة للموبايل
+    MAX_SCATTER_POINTS = 50  # أقل من قبل لتوفير data
+    MAX_SAMPLE_SIZE = 50
+    MAX_CORRELATION_COLS = 8
+    MAX_HISTOGRAM_BINS = 10
+    MAX_CATEGORICAL_VALUES = 8
+    MAX_SCATTER_PAIRS = 8  # أقل pairs
+    
+    # Processing
     LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
+    CHUNK_SIZE = 8192
+    
+    # API Keys - للتطبيق
+    API_KEYS = {
+        secrets.token_urlsafe(32): "android_app_v1",
+        # أضف المفاتيح هنا أو من environment variable
+    }
+    
+    # Add API keys from environment
+    env_api_keys = os.getenv('API_KEYS', '')
+    if env_api_keys:
+        for key in env_api_keys.split(','):
+            if key.strip():
+                API_KEYS[key.strip()] = "android_app"
 
 # ═══════════════════════════════════════════════════════════
 # APP INITIALIZATION
@@ -41,29 +76,32 @@ class Config:
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = Config.MAX_CONTENT_LENGTH
+app.config['COMPRESS_MIN_SIZE'] = 500  # ضغط أي response أكبر من 500 bytes
 
 # CORS
 CORS(app, resources={
     r"/*": {
         "origins": Config.ALLOWED_ORIGINS,
         "methods": ["GET", "POST"],
-        "allow_headers": ["Content-Type", "Authorization"]
+        "allow_headers": ["Content-Type", "Authorization", "X-API-Key"]
     }
 })
+
+# Compression
+Compress(app)
 
 # Rate Limiting
 limiter = Limiter(
     app=app,
     key_func=get_remote_address,
-    default_limits=[Config.RATE_LIMIT],
-    storage_uri="memory://"
+    default_limits=[Config.RATE_LIMIT]
 )
 
 # Caching
 cache = Cache(app, config={
     'CACHE_TYPE': 'simple',
     'CACHE_DEFAULT_TIMEOUT': Config.CACHE_DEFAULT_TIMEOUT,
-    'CACHE_THRESHOLD': 100
+    'CACHE_THRESHOLD': Config.CACHE_THRESHOLD
 })
 
 # Logging
@@ -72,6 +110,50 @@ logging.basicConfig(
     format='%(asctime)s %(levelname)s: %(message)s [in %(pathname)s:%(lineno)d]'
 )
 logger = logging.getLogger(__name__)
+
+# ═══════════════════════════════════════════════════════════
+# AUTHENTICATION
+# ═══════════════════════════════════════════════════════════
+
+def require_api_key(f):
+    """Decorator للتحقق من API key"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        api_key = request.headers.get('X-API-Key')
+        
+        if not api_key:
+            return jsonify({
+                "error": {
+                    "code": "AUTH_REQUIRED",
+                    "message": "API key is required",
+                    "user_action": "Please add X-API-Key header"
+                }
+            }), 401
+        
+        if api_key not in Config.API_KEYS:
+            logger.warning(f"Invalid API key attempt: {api_key[:10]}...")
+            return jsonify({
+                "error": {
+                    "code": "AUTH_INVALID",
+                    "message": "Invalid API key",
+                    "user_action": "Please check your API key"
+                }
+            }), 401
+        
+        # إضافة معلومات عن الـ client للـ request
+        request.client_type = Config.API_KEYS[api_key]
+        return f(*args, **kwargs)
+    
+    return decorated_function
+
+def get_request_id():
+    """إنشاء request ID فريد"""
+    return str(uuid.uuid4())
+
+@app.before_request
+def before_request():
+    """إضافة request ID لكل request"""
+    request.id = get_request_id()
 
 # ═══════════════════════════════════════════════════════════
 # HELPER FUNCTIONS
@@ -126,19 +208,42 @@ def detect_encoding(content_bytes):
 
 def detect_separator(sample_text):
     """اكتشاف الفاصل المستخدم"""
-    separators = [',', ';', '\t', '|']
-    best_sep = ','
-    best_count = 0
+    import csv
+    try:
+        sniffer = csv.Sniffer()
+        separator = sniffer.sniff(sample_text, delimiters=[',', ';', '\t', '|']).delimiter
+        return separator
+    except:
+        separators = [',', ';', '\t', '|']
+        best_sep = ','
+        best_count = 0
+        
+        first_line = sample_text.split('\n')[0] if sample_text else ''
+        
+        for sep in separators:
+            count = first_line.count(sep)
+            if count > best_count:
+                best_count = count
+                best_sep = sep
+        
+        return best_sep
+
+def read_file_in_chunks(file_storage):
+    """قراءة الملف على قطع لتوفير الذاكرة"""
+    chunks = []
+    total_size = 0
+    while True:
+        chunk = file_storage.read(Config.CHUNK_SIZE)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total_size += len(chunk)
+        
+        # حماية إضافية من الملفات الكبيرة
+        if total_size > Config.MAX_CONTENT_LENGTH:
+            raise ValueError("File too large")
     
-    first_line = sample_text.split('\n')[0] if sample_text else ''
-    
-    for sep in separators:
-        count = first_line.count(sep)
-        if count > best_count:
-            best_count = count
-            best_sep = sep
-    
-    return best_sep
+    return b''.join(chunks)
 
 def read_csv_smart(content_bytes):
     """قراءة CSV بذكاء"""
@@ -163,7 +268,7 @@ def read_csv_smart(content_bytes):
         logger.error(f"Failed to read CSV: {e}")
         raise ValueError(f"Could not decode CSV file: {str(e)}")
 
-def compute_histogram_bins(series, num_bins=12):
+def compute_histogram_bins(series, num_bins=10):
     """حساب bins للرسم البياني"""
     try:
         clean = series.dropna()
@@ -203,8 +308,8 @@ def compute_mode(s):
     except:
         return "N/A"
 
-def compute_scatter_data(s, max_points=80):
-    """إنشاء scatter data"""
+def compute_scatter_data(s, max_points=50):
+    """إنشاء scatter data - محسنة للموبايل"""
     try:
         n_points = min(max_points, len(s))
         if n_points == 0:
@@ -221,7 +326,7 @@ def compute_scatter_data(s, max_points=80):
     except:
         return []
 
-def compute_outlier_points(s, outliers_mask, max_points=40):
+def compute_outlier_points(s, outliers_mask, max_points=30):
     """حساب نقاط outliers"""
     try:
         outlier_vals = s[outliers_mask]
@@ -239,8 +344,8 @@ def compute_outlier_points(s, outliers_mask, max_points=40):
     except:
         return []
 
-def compute_sample_values(s, max_sample=120):
-    """حساب قيم عينة"""
+def compute_sample_values(s, max_sample=50):
+    """حساب قيم عينة - أقل للموبايل"""
     try:
         n_sample = min(max_sample, len(s))
         sample_vals = s.sample(n_sample, random_state=42).astype(float).tolist()
@@ -292,17 +397,17 @@ def compute_column_summary(series_full, col_name, include_visualizations=True):
             "skewness": safe_float(s.skew()),
             "kurtosis": safe_float(s.kurtosis()),
             "outlier_count": outlier_count,
-            "outlier_pct": safe_float(outlier_pct),
+            "outlier_pct": safe_float(outlier_pct) or 0.0,
             "null_count": null_count,
             "count": int(s.count()),
         }
         
         if include_visualizations:
             result.update({
-                "scatter_data": compute_scatter_data(s),
+                "scatter_data": compute_scatter_data(s, Config.MAX_SCATTER_POINTS),
                 "outlier_points": compute_outlier_points(s, outliers_mask),
-                "sample_values": compute_sample_values(s),
-                "histogram_bins": compute_histogram_bins(s)
+                "sample_values": compute_sample_values(s, Config.MAX_SAMPLE_SIZE),
+                "histogram_bins": compute_histogram_bins(s, Config.MAX_HISTOGRAM_BINS)
             })
         else:
             result.update({
@@ -328,8 +433,8 @@ def compute_column_summary(series_full, col_name, include_visualizations=True):
             "sample_values": [], "histogram_bins": []
         }
 
-def build_scatter_pairs(df, numeric_cols, max_cols=8, max_pairs=15, max_points=100):
-    """بناء scatter pairs"""
+def build_scatter_pairs(df, numeric_cols, max_cols=6, max_pairs=8, max_points=50):
+    """بناء scatter pairs - أقل للموبايل"""
     scatter_pairs = []
     if len(numeric_cols) < 2:
         return scatter_pairs
@@ -419,8 +524,24 @@ def compute_correlation(numeric_df, numeric_cols):
     
     return correlation
 
-def analyze_dataframe(df, include_visualizations=True):
-    """تحليل DataFrame كامل"""
+def validate_dataframe(df):
+    """التحقق من صحة البيانات"""
+    if df.empty:
+        raise ValueError("Empty dataframe - no data found")
+    
+    if df.shape[1] == 0:
+        raise ValueError("No columns found in the file")
+    
+    if len(df.columns) != len(set(df.columns)):
+        logger.warning("Duplicate column names found - will be renamed")
+        df.columns = [f"{col}_{i}" if list(df.columns).count(col) > 1 else col 
+                     for i, col in enumerate(df.columns)]
+    
+    return df
+
+def analyze_dataframe(df, include_visualizations=True, detail_level='medium'):
+    """تحليل DataFrame كامل مع مستويات تفاصيل مختلفة"""
+    df = validate_dataframe(df)
     df.columns = [str(c).strip() for c in df.columns]
     
     total_rows = int(df.shape[0])
@@ -442,11 +563,21 @@ def analyze_dataframe(df, include_visualizations=True):
     numeric_df = df.select_dtypes(include='number')
     numeric_cols = list(numeric_df.columns)
     
-    numeric_summary = {}
-    for col in numeric_cols:
-        numeric_summary[col] = compute_column_summary(
-            numeric_df[col], col, include_visualizations
-        )
+    # تحديد مستوى التفاصيل
+    if detail_level == 'low':
+        # إحصائيات أساسية فقط
+        numeric_summary = {}
+        for col in numeric_cols[:5]:  # أول 5 أعمدة فقط
+            numeric_summary[col] = compute_column_summary(
+                numeric_df[col], col, False  # بدون visualizations
+            )
+    else:
+        # إحصائيات كاملة
+        numeric_summary = {}
+        for col in numeric_cols:
+            numeric_summary[col] = compute_column_summary(
+                numeric_df[col], col, include_visualizations
+            )
     
     cat_cols = list(df.select_dtypes(include=['object', 'category', 'bool']).columns)
     cat_summary = {}
@@ -468,31 +599,39 @@ def analyze_dataframe(df, include_visualizations=True):
     
     correlation = compute_correlation(numeric_df, numeric_cols)
     
-    scatter_pairs = build_scatter_pairs(
-        df=df,
-        numeric_cols=numeric_cols,
-        max_cols=8,
-        max_pairs=15,
-        max_points=Config.MAX_SCATTER_POINTS
-    )
+    # Scatter pairs حسب مستوى التفاصيل
+    if detail_level == 'low':
+        scatter_pairs = []
+    else:
+        scatter_pairs = build_scatter_pairs(
+            df=df,
+            numeric_cols=numeric_cols,
+            max_cols=6,
+            max_pairs=Config.MAX_SCATTER_PAIRS,
+            max_points=Config.MAX_SCATTER_POINTS
+        )
     
-    return {
+    result = {
         "api_version": Config.API_VERSION,
+        "request_id": request.id if hasattr(request, 'id') else str(uuid.uuid4()),
         "total_rows": total_rows,
         "total_columns": total_columns,
         "columns": columns,
         "data_types": data_types,
         "duplicates": duplicates,
         "missing_values": missing_dict,
-        "missing_pct": safe_float(missing_pct),
+        "missing_pct": safe_float(missing_pct) or 0.0,
         "total_missing_values": total_missing,
         "numeric_cols": numeric_cols,
         "numeric_summary": numeric_summary,
         "categorical_cols": cat_cols,
         "cat_summary": cat_summary,
         "correlation": correlation,
-        "scatter_pairs": scatter_pairs
+        "scatter_pairs": scatter_pairs,
+        "detail_level": detail_level
     }
+    
+    return result
 
 def clean_dataframe(df):
     """تنظيف DataFrame"""
@@ -528,7 +667,10 @@ def clean_dataframe(df):
 def load_demo_stats():
     """تحميل الإحصائيات التجريبية"""
     try:
-        with open('data/stats.json', 'r', encoding='utf-8') as f:
+        BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+        stats_file = os.path.join(BASE_DIR, 'data', 'stats.json')
+        
+        with open(stats_file, 'r', encoding='utf-8') as f:
             return json.load(f)
     except:
         return {
@@ -556,7 +698,8 @@ def home():
             "/stats": "GET - GoBike demo statistics",
             "/analyze": "POST - Upload and analyze CSV file",
             "/clean": "POST - Clean CSV data",
-            "/health": "GET - Server health check"
+            "/health": "GET - Server health check",
+            "/version": "GET - Check API version for updates"
         }
     })
 
@@ -571,8 +714,24 @@ def health():
         "timestamp": int(time.time())
     })
 
+@app.route('/version')
+def check_version():
+    """التحقق من إصدار API للتطبيق"""
+    return jsonify({
+        "api_version": Config.API_VERSION,
+        "minimum_android_version": "1.0.0",
+        "force_update": False,
+        "update_message": None,
+        "endpoints": {
+            "analyze": "/analyze",
+            "clean": "/clean",
+            "stats": "/stats"
+        }
+    })
+
 @app.route('/stats')
 @cache.cached(timeout=Config.CACHE_DEFAULT_TIMEOUT)
+@require_api_key
 def stats():
     """Get demo statistics"""
     try:
@@ -580,6 +739,7 @@ def stats():
         
         response = {
             "api_version": Config.API_VERSION,
+            "request_id": request.id,
             "total_trips": demo_stats.get("total_trips", 183416),
             "summary": {
                 "avg_duration_min": demo_stats.get("avg_duration_min", 12.1),
@@ -598,10 +758,17 @@ def stats():
         return jsonify(response)
     except Exception as e:
         logger.error(f"Error loading stats: {e}")
-        return jsonify({"error": "Failed to load statistics"}), 500
+        return jsonify({
+            "error": {
+                "code": "STATS_ERROR",
+                "message": "Failed to load statistics",
+                "user_action": "Please try again later"
+            }
+        }), 500
 
 @app.route('/analyze', methods=['POST'])
 @limiter.limit(Config.RATE_LIMIT)
+@require_api_key
 def analyze():
     """Analyze uploaded CSV file"""
     t0 = time.time()
@@ -609,135 +776,234 @@ def analyze():
     try:
         if 'file' not in request.files:
             return jsonify({
-                "error": "No file uploaded",
-                "message": "Please upload a CSV file using the 'file' field"
+                "error": {
+                    "code": "NO_FILE",
+                    "message": "No file uploaded",
+                    "user_action": "Please upload a CSV file using the 'file' field"
+                }
             }), 400
         
         file = request.files['file']
         if file.filename == '':
             return jsonify({
-                "error": "No file selected",
-                "message": "Please select a file to upload"
+                "error": {
+                    "code": "NO_FILE_SELECTED",
+                    "message": "No file selected",
+                    "user_action": "Please select a file to upload"
+                }
             }), 400
         
         if not file.filename.lower().endswith('.csv'):
             return jsonify({
-                "error": "Invalid file type",
-                "message": "File must be a CSV file"
+                "error": {
+                    "code": "INVALID_FILE_TYPE",
+                    "message": "Invalid file type",
+                    "user_action": "File must be a CSV file"
+                }
             }), 400
         
-        content_bytes = file.read()
+        # الحصول على مستوى التفاصيل
+        detail_level = request.args.get('detail', 'medium')  # low, medium, high
+        
+        # قراءة الملف
+        content_bytes = read_file_in_chunks(file)
         
         file_hash = get_file_hash(content_bytes)
-        cache_key = f"analysis_{file_hash}"
+        cache_key = f"analysis_{file_hash}_{detail_level}"
         
         cached_result = cache.get(cache_key)
         if cached_result:
             cached_result['cached'] = True
             cached_result['message'] = "Result retrieved from cache"
+            cached_result['request_id'] = request.id
             return jsonify(cached_result)
         
         try:
             df = read_csv_smart(content_bytes)
-        except Exception as e:
+        except ValueError as e:
             logger.error(f"Failed to read CSV: {e}")
             return jsonify({
-                "error": "Failed to read CSV",
-                "message": "The file could not be read. Please check the file format."
+                "error": {
+                    "code": "CSV_READ_ERROR",
+                    "message": "The file could not be read",
+                    "user_action": "Please check the file format"
+                }
             }), 400
         
         include_viz = request.args.get('include_viz', 'true').lower() == 'true'
         
-        result = analyze_dataframe(df, include_viz)
+        result = analyze_dataframe(df, include_viz, detail_level)
         
         elapsed_ms = int((time.time() - t0) * 1000)
         result['processing_ms'] = elapsed_ms
         result['cached'] = False
         result['message'] = "File analyzed successfully"
+        result['request_id'] = request.id
         
+        # Cache النتيجة
         cache.set(cache_key, result, timeout=Config.CACHE_DEFAULT_TIMEOUT)
+        
+        # تسجيل العملية
+        logger.info(f"Request {request.id}: File analyzed - {file.filename} - {total_rows} rows - {elapsed_ms}ms")
         
         return jsonify(result)
         
     except Exception as e:
-        logger.error(f"Analysis failed: {str(e)}")
+        logger.error(f"Analysis failed for request {request.id}: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({
-            "error": "Analysis failed",
-            "message": "An error occurred while analyzing the file. Please try again."
+            "error": {
+                "code": "ANALYSIS_FAILED",
+                "message": "An error occurred while analyzing the file",
+                "user_action": "Please try again later"
+            }
         }), 500
 
 @app.route('/clean', methods=['POST'])
-@limiter.limit(Config.RATE_LIMIT)
+@limiter.limit(Config.RATE_LIMIT_CLEAN)
+@require_api_key
 def clean():
-    """Clean uploaded CSV file"""
+    """Clean uploaded CSV file - returns downloadable file"""
     try:
         if 'file' not in request.files:
             return jsonify({
-                "error": "No file uploaded",
-                "message": "Please upload a CSV file using the 'file' field"
+                "error": {
+                    "code": "NO_FILE",
+                    "message": "No file uploaded",
+                    "user_action": "Please upload a CSV file using the 'file' field"
+                }
             }), 400
         
         file = request.files['file']
         if file.filename == '':
             return jsonify({
-                "error": "No file selected",
-                "message": "Please select a file to upload"
+                "error": {
+                    "code": "NO_FILE_SELECTED",
+                    "message": "No file selected",
+                    "user_action": "Please select a file to upload"
+                }
             }), 400
         
         if not file.filename.lower().endswith('.csv'):
             return jsonify({
-                "error": "Invalid file type",
-                "message": "File must be a CSV file"
+                "error": {
+                    "code": "INVALID_FILE_TYPE",
+                    "message": "Invalid file type",
+                    "user_action": "File must be a CSV file"
+                }
             }), 400
         
-        content_bytes = file.read()
+        content_bytes = read_file_in_chunks(file)
         
         try:
             df = read_csv_smart(content_bytes)
-        except Exception as e:
+        except ValueError as e:
             logger.error(f"Failed to read CSV: {e}")
             return jsonify({
-                "error": "Failed to read CSV",
-                "message": "The file could not be read. Please check the file format."
+                "error": {
+                    "code": "CSV_READ_ERROR",
+                    "message": "The file could not be read",
+                    "user_action": "Please check the file format"
+                }
             }), 400
         
         df_cleaned, before, after = clean_dataframe(df)
         
+        # تحضير الملف للتنزيل
         csv_buffer = io.StringIO()
         df_cleaned.to_csv(csv_buffer, index=False, encoding='utf-8')
         csv_string = csv_buffer.getvalue()
         
-        csv_base64 = base64.b64encode(csv_string.encode('utf-8')).decode('utf-8')
-        
         original_name = file.filename.rsplit('.', 1)[0]
         clean_filename = f"cleaned_{original_name}.csv"
+        
+        # إحصائيات التنظيف
+        cleaning_stats = {
+            "before": before,
+            "after": after,
+            "duplicates_removed": before['duplicates'],
+            "missing_values_filled": before['missing'] - after['missing'],
+            "rows_removed": before['rows'] - after['rows']
+        }
+        
+        logger.info(f"Request {request.id}: File cleaned - {file.filename} - {cleaning_stats['rows_removed']} rows removed")
+        
+        # إرجاع الملف مباشرة مع الإحصائيات في headers
+        response = send_file(
+            io.BytesIO(csv_string.encode('utf-8')),
+            mimetype='text/csv',
+            as_attachment=True,
+            download_name=clean_filename
+        )
+        
+        # إضافة الإحصائيات في headers
+        response.headers['X-Cleaning-Stats'] = json.dumps(cleaning_stats)
+        response.headers['X-Request-ID'] = request.id
+        
+        return response
+        
+    except Exception as e:
+        logger.error(f"Cleaning failed for request {request.id}: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({
+            "error": {
+                "code": "CLEANING_FAILED",
+                "message": "An error occurred while cleaning the file",
+                "user_action": "Please try again later"
+            }
+        }), 500
+
+@app.route('/clean-stats', methods=['POST'])
+@limiter.limit(Config.RATE_LIMIT_CLEAN)
+@require_api_key
+def clean_stats():
+    """Clean CSV file and return only statistics (بدون تنزيل الملف)"""
+    try:
+        if 'file' not in request.files:
+            return jsonify({
+                "error": {
+                    "code": "NO_FILE",
+                    "message": "No file uploaded"
+                }
+            }), 400
+        
+        file = request.files['file']
+        content_bytes = read_file_in_chunks(file)
+        
+        try:
+            df = read_csv_smart(content_bytes)
+        except ValueError as e:
+            return jsonify({
+                "error": {
+                    "code": "CSV_READ_ERROR",
+                    "message": "The file could not be read"
+                }
+            }), 400
+        
+        df_cleaned, before, after = clean_dataframe(df)
+        
+        cleaning_stats = {
+            "before": before,
+            "after": after,
+            "duplicates_removed": before['duplicates'],
+            "missing_values_filled": before['missing'] - after['missing'],
+            "rows_removed": before['rows'] - after['rows'],
+            "request_id": request.id
+        }
         
         return jsonify({
             "success": True,
             "message": "File cleaned successfully",
-            "cleaning_stats": {
-                "before": before,
-                "after": after,
-                "duplicates_removed": before['duplicates'],
-                "missing_values_filled": before['missing'] - after['missing'],
-                "rows_removed": before['rows'] - after['rows']
-            },
-            "cleaned_file": {
-                "filename": clean_filename,
-                "content_base64": csv_base64,
-                "size_bytes": len(csv_string.encode('utf-8')),
-                "encoding": "utf-8",
-                "format": "csv"
-            }
+            "cleaning_stats": cleaning_stats
         })
         
     except Exception as e:
-        logger.error(f"Cleaning failed: {str(e)}")
-        logger.error(traceback.format_exc())
+        logger.error(f"Cleaning stats failed for request {request.id}: {str(e)}")
         return jsonify({
-            "error": "Cleaning failed",
-            "message": "An error occurred while cleaning the file. Please try again."
+            "error": {
+                "code": "CLEANING_FAILED",
+                "message": "An error occurred while cleaning the file"
+            }
         }), 500
 
 # ═══════════════════════════════════════════════════════════
@@ -746,30 +1012,65 @@ def clean():
 
 @app.errorhandler(400)
 def bad_request(e):
-    return jsonify({"error": "Bad request", "message": "The request could not be understood"}), 400
+    return jsonify({
+        "error": {
+            "code": "BAD_REQUEST",
+            "message": "The request could not be understood",
+            "user_action": "Please check your request and try again"
+        }
+    }), 400
 
 @app.errorhandler(404)
 def not_found(e):
-    return jsonify({"error": "Not found", "message": "The requested endpoint does not exist"}), 404
+    return jsonify({
+        "error": {
+            "code": "NOT_FOUND",
+            "message": "The requested endpoint does not exist",
+            "user_action": "Please check the API documentation"
+        }
+    }), 404
 
 @app.errorhandler(413)
 def too_large(e):
-    return jsonify({"error": "File too large", "message": f"Maximum file size is {Config.MAX_CONTENT_LENGTH // (1024*1024)}MB"}), 413
+    return jsonify({
+        "error": {
+            "code": "FILE_TOO_LARGE",
+            "message": f"Maximum file size is {Config.MAX_CONTENT_LENGTH // (1024*1024)}MB",
+            "user_action": "Please select a smaller file"
+        }
+    }), 413
 
 @app.errorhandler(429)
 def ratelimit_handler(e):
-    return jsonify({"error": "Rate limit exceeded", "message": "Too many requests. Please try again later."}), 429
+    return jsonify({
+        "error": {
+            "code": "RATE_LIMIT_EXCEEDED",
+            "message": "Too many requests",
+            "user_action": "Please wait before making more requests",
+            "retry_after": e.description if hasattr(e, 'description') else 60
+        }
+    }), 429
 
 @app.errorhandler(500)
 def server_error(e):
     logger.error(f"Internal server error: {e}")
-    return jsonify({"error": "Internal server error", "message": "An unexpected error occurred"}), 500
+    return jsonify({
+        "error": {
+            "code": "SERVER_ERROR",
+            "message": "An unexpected error occurred",
+            "user_action": "Please try again later"
+        }
+    }), 500
 
-@app.errorhandler(Exception)
-def unhandled_exception(e):
-    logger.error(f"Unhandled exception: {e}")
-    logger.error(traceback.format_exc())
-    return jsonify({"error": "Unexpected error", "message": "An unexpected error occurred. Please try again later."}), 500
+@app.errorhandler(401)
+def unauthorized(e):
+    return jsonify({
+        "error": {
+            "code": "UNAUTHORIZED",
+            "message": "Authentication required",
+            "user_action": "Please provide a valid API key"
+        }
+    }), 401
 
 # ═══════════════════════════════════════════════════════════
 # MAIN
@@ -777,6 +1078,13 @@ def unhandled_exception(e):
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
+    
+    # طباعة معلومات التشغيل
+    logger.info(f"Starting GoBike Analysis API v{Config.API_VERSION}")
+    logger.info(f"Port: {port}")
+    logger.info(f"Rate Limit: {Config.RATE_LIMIT}")
+    logger.info(f"Max File Size: {Config.MAX_CONTENT_LENGTH // (1024*1024)}MB")
+    
     app.run(
         debug=False,
         host='0.0.0.0',
