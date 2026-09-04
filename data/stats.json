@@ -1,0 +1,9 @@
+{
+    "total_trips": 183416,
+    "avg_duration_min": 12.1,
+    "avg_age": 40.2,
+    "top_user_type": "Subscriber",
+    "top_gender": "Male",
+    "subscriber_pct": 89.2,
+    "male_pct": 75.7
+}
