@@ -28,7 +28,7 @@ from datetime import datetime, timedelta
 # ═══════════════════════════════════════════════════════════
 
 class Config:
-    API_VERSION = "2.1.1"
+    API_VERSION = "2.1.2"
     MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50MB
 
     # CORS - مش مهمة للتطبيق لكن للـ testing
@@ -354,24 +354,65 @@ def compute_sample_values(s, max_sample=50):
         return []
 
 def compute_column_summary(series_full, col_name, include_visualizations=True):
-    """حساب إحصائيات عمود"""
+    """
+    حساب إحصائيات عمود.
+
+    كل مجموعة إحصائيات ليها try/except منفصل، عشان لو حاجة فيها اتكسرت
+    (زي skew/kurtosis مع variance=0، أو IQR مع بيانات غريبة) البيانات
+    الأساسية (mean/median/mode/std/min/max) متتمسحش وترجع None.
+    ده كان سبب المشكلة الأصلية: try واحد كبير بيلف كل حاجة، فأي exception
+    في أي سطر بيرجع dict كامل فيه كل القيم None حتى لو كانت اتحسبت صح.
+    """
     null_count = int(series_full.isnull().sum())
     s = series_full.dropna()
     s = s.replace([np.inf, -np.inf], np.nan).dropna()
 
-    if len(s) == 0:
-        return {
-            "mean": None, "median": None, "mode": "N/A",
-            "std": None, "variance": None, "min": None, "max": None,
-            "q1": None, "q3": None, "iqr": None,
-            "skewness": None, "kurtosis": None,
-            "outlier_count": 0, "outlier_pct": 0.0,
-            "null_count": null_count,
-            "count": 0,
-            "scatter_data": [], "outlier_points": [],
-            "sample_values": [], "histogram_bins": []
-        }
+    result = {
+        "mean": None, "median": None, "mode": "N/A",
+        "std": None, "variance": None, "min": None, "max": None,
+        "q1": None, "q3": None, "iqr": None,
+        "skewness": None, "kurtosis": None,
+        "outlier_count": 0, "outlier_pct": 0.0,
+        "null_count": null_count,
+        "count": int(s.count()),
+        "scatter_data": [], "outlier_points": [],
+        "sample_values": [], "histogram_bins": []
+    }
 
+    if len(s) == 0:
+        return result
+
+    # --- إحصائيات أساسية: كل واحدة معزولة عن التانية ---
+    try:
+        result["mean"] = safe_float(s.mean())
+    except Exception as e:
+        logger.warning(f"mean failed for {col_name}: {e}")
+
+    try:
+        result["median"] = safe_float(s.median())
+    except Exception as e:
+        logger.warning(f"median failed for {col_name}: {e}")
+
+    result["mode"] = compute_mode(s)
+
+    try:
+        result["std"] = safe_float(s.std())
+    except Exception as e:
+        logger.warning(f"std failed for {col_name}: {e}")
+
+    try:
+        result["variance"] = safe_float(s.var())
+    except Exception as e:
+        logger.warning(f"variance failed for {col_name}: {e}")
+
+    try:
+        result["min"] = safe_float(s.min())
+        result["max"] = safe_float(s.max())
+    except Exception as e:
+        logger.warning(f"min/max failed for {col_name}: {e}")
+
+    # --- IQR / outliers ---
+    outliers_mask = pd.Series([False] * len(s), index=s.index)
     try:
         q1 = float(s.quantile(0.25))
         q3 = float(s.quantile(0.75))
@@ -383,55 +424,48 @@ def compute_column_summary(series_full, col_name, include_visualizations=True):
         outlier_count = int(outliers_mask.sum())
         outlier_pct = (outlier_count / len(s)) * 100.0 if outlier_count > 0 else 0.0
 
-        result = {
-            "mean": safe_float(s.mean()),
-            "median": safe_float(s.median()),
-            "mode": compute_mode(s),
-            "std": safe_float(s.std()),
-            "variance": safe_float(s.var()),
-            "min": safe_float(s.min()),
-            "max": safe_float(s.max()),
-            "q1": safe_float(q1),
-            "q3": safe_float(q3),
-            "iqr": safe_float(iqr),
-            "skewness": safe_float(s.skew()),
-            "kurtosis": safe_float(s.kurtosis()),
-            "outlier_count": outlier_count,
-            "outlier_pct": safe_float(outlier_pct) or 0.0,
-            "null_count": null_count,
-            "count": int(s.count()),
-        }
-
-        if include_visualizations:
-            result.update({
-                "scatter_data": compute_scatter_data(s, Config.MAX_SCATTER_POINTS),
-                "outlier_points": compute_outlier_points(s, outliers_mask),
-                "sample_values": compute_sample_values(s, Config.MAX_SAMPLE_SIZE),
-                "histogram_bins": compute_histogram_bins(s, Config.MAX_HISTOGRAM_BINS)
-            })
-        else:
-            result.update({
-                "scatter_data": [],
-                "outlier_points": [],
-                "sample_values": [],
-                "histogram_bins": []
-            })
-
-        return result
-
+        result["q1"] = safe_float(q1)
+        result["q3"] = safe_float(q3)
+        result["iqr"] = safe_float(iqr)
+        result["outlier_count"] = outlier_count
+        result["outlier_pct"] = safe_float(outlier_pct) or 0.0
     except Exception as e:
-        logger.error(f"Error computing summary for {col_name}: {e}")
-        return {
-            "mean": None, "median": None, "mode": "N/A",
-            "std": None, "variance": None, "min": None, "max": None,
-            "q1": None, "q3": None, "iqr": None,
-            "skewness": None, "kurtosis": None,
-            "outlier_count": 0, "outlier_pct": 0.0,
-            "null_count": null_count,
-            "count": int(s.count()),
-            "scatter_data": [], "outlier_points": [],
-            "sample_values": [], "histogram_bins": []
-        }
+        logger.warning(f"IQR/outliers failed for {col_name}: {e}")
+
+    # --- skewness / kurtosis ---
+    try:
+        result["skewness"] = safe_float(s.skew())
+    except Exception as e:
+        logger.warning(f"skewness failed for {col_name}: {e}")
+
+    try:
+        result["kurtosis"] = safe_float(s.kurtosis())
+    except Exception as e:
+        logger.warning(f"kurtosis failed for {col_name}: {e}")
+
+    # --- visualizations ---
+    if include_visualizations:
+        try:
+            result["scatter_data"] = compute_scatter_data(s, Config.MAX_SCATTER_POINTS)
+        except Exception as e:
+            logger.warning(f"scatter_data failed for {col_name}: {e}")
+
+        try:
+            result["outlier_points"] = compute_outlier_points(s, outliers_mask)
+        except Exception as e:
+            logger.warning(f"outlier_points failed for {col_name}: {e}")
+
+        try:
+            result["sample_values"] = compute_sample_values(s, Config.MAX_SAMPLE_SIZE)
+        except Exception as e:
+            logger.warning(f"sample_values failed for {col_name}: {e}")
+
+        try:
+            result["histogram_bins"] = compute_histogram_bins(s, Config.MAX_HISTOGRAM_BINS)
+        except Exception as e:
+            logger.warning(f"histogram_bins failed for {col_name}: {e}")
+
+    return result
 
 def build_scatter_pairs(df, numeric_cols, max_cols=6, max_pairs=8, max_points=50):
     """بناء scatter pairs - أقل للموبايل"""
@@ -545,7 +579,15 @@ def validate_dataframe(df):
     return df
 
 def analyze_dataframe(df, include_visualizations=True, detail_level='medium'):
-    """تحليل DataFrame كامل مع مستويات تفاصيل مختلفة"""
+    """
+    تحليل DataFrame كامل مع مستويات تفاصيل مختلفة.
+
+    ملاحظة: في detail_level='low' كنا بنقتصر على أول 5 أعمدة رقمية فقط
+    (numeric_cols[:5])، وده معناه إن أي عمود بعد الخامس ميظهرش ليه أي
+    إحصائيات (بما فيها median) خالص - مش لأنها غلط، لأنها مش بتتحسب أصلاً.
+    ده سلوك مقصود لتخفيف الحمل، لكن سيبناه زي ما هو - لو عايز كل الأعمدة
+    حتى في low detail استخدم detail=medium أو detail=high بدل كده.
+    """
     df = validate_dataframe(df)
     df.columns = [str(c).strip() for c in df.columns]
 
@@ -570,14 +612,14 @@ def analyze_dataframe(df, include_visualizations=True, detail_level='medium'):
 
     # تحديد مستوى التفاصيل
     if detail_level == 'low':
-        # إحصائيات أساسية فقط
+        # إحصائيات أساسية فقط - أول 5 أعمدة رقمية بدون visualizations
         numeric_summary = {}
-        for col in numeric_cols[:5]:  # أول 5 أعمدة فقط
+        for col in numeric_cols[:5]:
             numeric_summary[col] = compute_column_summary(
-                numeric_df[col], col, False  # بدون visualizations
+                numeric_df[col], col, False
             )
     else:
-        # إحصائيات كاملة
+        # إحصائيات كاملة لكل الأعمدة الرقمية
         numeric_summary = {}
         for col in numeric_cols:
             numeric_summary[col] = compute_column_summary(
@@ -849,7 +891,6 @@ def analyze():
         cache.set(cache_key, result, timeout=Config.CACHE_DEFAULT_TIMEOUT)
 
         # تسجيل العملية
-        # (تم استخدام result['total_rows'] بدل المتغيّر total_rows اللي مش موجود في الـ scope ده أصلاً - ده كان سبب فشل الـ endpoint بالكامل)
         logger.info(
             f"Request {request.id}: File analyzed - {file.filename} - "
             f"{result['total_rows']} rows - {elapsed_ms}ms"
